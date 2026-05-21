@@ -47,6 +47,7 @@ class AppConfig:
     detent_config: DetentConfig = field(default_factory=DetentConfig)
     manual_mode_gui_enabled: bool = False
     remember_settings: bool = True
+    scale_um_per_px: float = 0.0  # µm per pixel; 0 = not yet calibrated
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -70,6 +71,7 @@ class AppConfig:
             detent_config=detent,
             manual_mode_gui_enabled=bool(data.get("manual_mode_gui_enabled", False)),
             remember_settings=bool(data.get("remember_settings", True)),
+            scale_um_per_px=float(data.get("scale_um_per_px", 0.0)),
         )
 
 

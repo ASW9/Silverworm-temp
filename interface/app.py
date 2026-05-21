@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
+import numpy as np
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QFrame, QScrollArea,
@@ -33,16 +35,19 @@ from PyQt6.QtGui import (
 
 # Camera and processing modules
 from camera import CameraDetector, CameraWorker, CameraConfig
+from camera.rolling_buffer import RollingBuffer
 from processing import PitchDetectionPipeline
 from ui.camera_widget import EnhancedCameraView
 from ui.manual_mode_dialog import ManualModeBanner
+from ui.manual_overlay_panel import ManualOverlayPanel
 from ui.startup_dialog import StartupConfigDialog
 
 # Controller and comms
 from controller import SetpointController, OperatingMode, Setpoints, SPEED_A_MIN, SPEED_A_MAX, SPEED_B_MIN, SPEED_B_MAX
 from comms import MockTransport, Transport
 
-from config import AppConfig, load_config, save_config
+from config import AppConfig, load_config, save_config, calculate_wrap_angle_deg
+from storage import StorageManager
 
 # ============================================================================
 # COLOR THEME
@@ -363,7 +368,7 @@ class MotorMetricPanel(GlowingCard):
         metrics.setSpacing(16)
 
         # Target
-        self._add_metric(metrics, 0, "TARGET", f"{target_rpm:.0f} RPM", Theme.TEXT_SECONDARY)
+        self._target_label = self._add_metric(metrics, 0, "TARGET", f"{target_rpm:.0f} RPM", Theme.TEXT_SECONDARY)
 
         # Actual
         actual_label = QLabel("ACTUAL")
@@ -463,8 +468,18 @@ class MotorMetricPanel(GlowingCard):
         value.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
         value.setStyleSheet(f"color: {color};")
         layout.addWidget(value, 1, col)
+        return value
+
+    def set_target(self, rpm: float) -> None:
+        """Update the TARGET setpoint shown in the panel header."""
+        self.target_rpm = rpm
+        self._target_label.setText(f"{rpm:.0f} RPM")
 
     def update_metrics(self, actual: float):
+        if self.target_rpm == 0.0:
+            self.actual_value.set_value(actual, "RPM", 1)
+            self.error_value.setText("--")
+            return
         error = abs((actual - self.target_rpm) / self.target_rpm * 100)
 
         self.actual_value.set_value(actual, "RPM", 1)
@@ -851,11 +866,23 @@ class MainWindow(QMainWindow):
         self.config = config
         self._is_running = False
         self._distance = 0
+        self._calibrated_scale_um_per_px: float = config.scale_um_per_px
+        # True once user has clicked Apply in ManualOverlayPanel.
+        # Prevents pipeline results from overwriting a manually-committed value.
+        self._calibration_manually_applied: bool = config.scale_um_per_px > 0
 
         # Camera and processing components
-        self.camera_worker: Optional[CameraWorker] = None
+        self.camera_worker: Optional[CameraWorker] = None          # active worker (alias)
+        self._primary_worker: Optional[CameraWorker] = None        # microscope
+        self._secondary_worker: Optional[CameraWorker] = None      # external webcam
+        self._active_camera: str = "microscope"
+        self._current_raw_frame: Optional[np.ndarray] = None       # latest frame for auto-capture
         self.pitch_pipeline = PitchDetectionPipeline(interval_ms=2000, parent=self)
         self.manual_banner: Optional[ManualModeBanner] = None
+
+        # Rolling 5-minute incident buffer + file storage
+        self.rolling_buffer = RollingBuffer(window_seconds=300.0)
+        self.storage = StorageManager()
 
         # Controller + comms (MockTransport for dev; swap for SerialTransport on Pi)
         self.controller = SetpointController()
@@ -935,6 +962,10 @@ class MainWindow(QMainWindow):
         snapshot_action.setShortcut("Ctrl+S")
         snapshot_action.triggered.connect(self._on_snapshot)
 
+        recording_action = file_menu.addAction("Save Last 5-Minute Recording")
+        recording_action.setShortcut("Ctrl+R")
+        recording_action.triggered.connect(self._on_save_recording)
+
         # Debug menu: simulate PUI messages from the GUI. Useful on macOS where
         # there's no real I2C device. Remove once a hardware PUI is connected.
         debug_menu = menu_bar.addMenu("Debug")
@@ -977,6 +1008,12 @@ class MainWindow(QMainWindow):
             self.controls.set_manual_mode(is_manual)
             self.feed_motor.set_manual_mode(is_manual)
             self.wrapper_motor.set_manual_mode(is_manual)
+            if is_manual:
+                self._manual_overlay_panel.show()
+                self._recompute_pitch_overlay()
+            else:
+                self._manual_overlay_panel.hide()
+                self.camera.clear_pitch_overlay()
 
         # Power signal: log + drive the running/stopped UI state.
         def on_power(on: bool):
@@ -1068,21 +1105,59 @@ class MainWindow(QMainWindow):
         cam_title = QLabel("Live Camera View")
         cam_title.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
         cam_title.setStyleSheet(f"color: {Theme.ACCENT_PRIMARY};")
-        
+
         cam_hint = QLabel("Click to focus • Arrow keys move crosshair • Shift for faster")
         cam_hint.setFont(QFont("Segoe UI", 9))
         cam_hint.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
-        
+
+        # Camera source toggle button (microscope ↔ webcam)
+        self._cam_toggle_btn = QPushButton("Switch to Webcam")
+        self._cam_toggle_btn.setFixedHeight(26)
+        self._cam_toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Theme.BG_ELEVATED};
+                color: {Theme.TEXT_SECONDARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 4px;
+                padding: 0 10px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.BG_HOVER};
+                color: {Theme.ACCENT_PRIMARY};
+                border-color: {Theme.ACCENT_PRIMARY};
+            }}
+            QPushButton:disabled {{
+                color: {Theme.TEXT_DISABLED};
+            }}
+        """)
+        self._cam_toggle_btn.setEnabled(False)  # enabled once second camera found
+        self._cam_toggle_btn.clicked.connect(self._on_camera_toggle)
+
+        # Label shown when camera feed is degraded/unavailable
+        self._cam_warning_label = QLabel()
+        self._cam_warning_label.setStyleSheet(f"color: {Theme.WARNING}; font-size: 11px;")
+        self._cam_warning_label.hide()
+
         cam_header.addWidget(cam_title)
         cam_header.addStretch()
+        cam_header.addWidget(self._cam_warning_label)
         cam_header.addWidget(cam_hint)
+        cam_header.addWidget(self._cam_toggle_btn)
         camera_layout.addLayout(cam_header)
         
         self.camera = EnhancedCameraView()
         camera_layout.addWidget(self.camera)
         
         left.addWidget(camera_card, 2)
-        
+
+        # Manual mode overlay calibration panel (hidden until manual mode is active)
+        self._manual_overlay_panel = ManualOverlayPanel()
+        self._manual_overlay_panel.scale_applied.connect(self._on_overlay_scale_applied)
+        self._manual_overlay_panel.set_scale(self._calibrated_scale_um_per_px)
+        self._manual_overlay_panel.hide()
+        left.addWidget(self._manual_overlay_panel)
+
         # Graph
         self.graph = PitchGraph()
         left.addWidget(self.graph, 1)
@@ -1192,6 +1267,7 @@ class MainWindow(QMainWindow):
         through verbatim.
         """
         self.app_state.gui_set_feed_speed(value)
+        self.feed_motor.set_target(value)
         # Legacy path — kept so the controller-driven banners still fire.
         if self.controller.set_manual_speed_a(value):
             if self._last_comms_ok:
@@ -1205,6 +1281,7 @@ class MainWindow(QMainWindow):
     def _on_wrapper_motor_set(self, value: float):
         """User clicked SET on wrapper motor panel."""
         self.app_state.gui_set_wrap_speed(value)
+        self.wrapper_motor.set_target(value)
         if self.controller.set_manual_speed_b(value):
             if self._last_comms_ok:
                 self.camera.show_overlay_message(
@@ -1213,6 +1290,33 @@ class MainWindow(QMainWindow):
                 self.alert_log.log(
                     f"Wrapper motor speed manually set: {value:.1f} RPM", "success"
                 )
+
+    def _on_overlay_scale_applied(self, um_per_px: float) -> None:
+        """User clicked Apply in the overlay panel."""
+        self._calibrated_scale_um_per_px = um_per_px
+        self._calibration_manually_applied = True
+        self.config.scale_um_per_px = um_per_px
+        save_config(self.config)
+        self._recompute_pitch_overlay()
+        self.alert_log.log(f"Overlay scale set: {um_per_px:.4g} µm/px", "info")
+
+    def _recompute_pitch_overlay(self) -> None:
+        """Compute overlay from current scale and config geometry, then push to camera.
+
+        The spool is always horizontal so lines are always nearly vertical.
+        Tilt = helix advance angle from config (arctan(P / π(D+2t))).
+        Only scale is unknown — if it hasn't been set yet, clear the overlay.
+        """
+        scale = self._calibrated_scale_um_per_px
+        if scale <= 0:
+            scale = 2.0  # fallback until user enters a calibrated value
+        spacing_px = self.config.target_pitch_um / scale
+        tilt_deg = calculate_wrap_angle_deg(
+            self.config.target_pitch_um,
+            self.config.tube_diameter_mm,
+            self.config.wire_thickness_um,
+        )
+        self.camera.set_pitch_overlay(spacing_px, tilt_deg)
 
     def _on_controller_mode_changed(self, mode: OperatingMode):
         """React to mode changes from the controller."""
@@ -1287,65 +1391,89 @@ class MainWindow(QMainWindow):
         """)
 
     def _setup_camera(self):
-        """Detect and initialize camera"""
+        """Detect and initialize up to two camera workers (microscope + webcam)."""
         detector = CameraDetector()
         diag = detector.detect_all_devices()
 
-        # Print diagnostic report to console
-        report = detector.format_diagnostic_report()
-        print(report)
-
-        # Log summary to UI
+        print(detector.format_diagnostic_report())
         self.alert_log.log("Running camera diagnostics...", "info")
 
-        if diag.selected_device:
+        if not diag.devices:
+            self.alert_log.log("No camera detected — running in demo mode", "warning")
+            for err in diag.errors:
+                self.alert_log.log(err, "error")
+            for warn in diag.warnings[:2]:
+                self.alert_log.log(warn, "warning")
+            return
+
+        # Rank all detected devices by priority (highest first)
+        sorted_devices = sorted(diag.devices, key=lambda d: d.priority, reverse=True)
+        primary_device = sorted_devices[0]
+        secondary_device = sorted_devices[1] if len(sorted_devices) > 1 else None
+
+        cam_cfg = CameraConfig.amscope_8300p_lowres()
+        webcam_cfg = CameraConfig.default()
+
+        # Primary (microscope / best-priority) worker
+        self._primary_worker = CameraWorker(
+            device_index=primary_device.index,
+            config=cam_cfg,
+            parent=self,
+        )
+        self._primary_worker.start()
+        self.alert_log.log(
+            f"Primary camera: {primary_device.name} ({primary_device.path})", "success"
+        )
+
+        # Secondary (external webcam) worker — started but not yet displayed
+        if secondary_device:
+            self._secondary_worker = CameraWorker(
+                device_index=secondary_device.index,
+                config=webcam_cfg,
+                parent=self,
+            )
+            self._secondary_worker.start()
             self.alert_log.log(
-                f"Camera found: {diag.selected_device.name} ({diag.selected_device.path})",
-                "success"
+                f"Secondary camera: {secondary_device.name} ({secondary_device.path})", "info"
             )
-
-            # Create camera worker with lower resolution for responsiveness
-            config = CameraConfig.amscope_8300p_lowres()
-            self.camera_worker = CameraWorker(
-                device_index=diag.selected_device.index,
-                config=config,
-                parent=self
-            )
-
-            # Start worker thread
-            self.camera_worker.start()
+            self._cam_toggle_btn.setEnabled(True)
         else:
-            self.alert_log.log("No camera detected - running in demo mode", "warning")
-            if diag.errors:
-                for err in diag.errors:
-                    self.alert_log.log(err, "error")
-            if diag.warnings:
-                for warn in diag.warnings[:2]:  # Show first 2 warnings
-                    self.alert_log.log(warn, "warning")
+            self._cam_toggle_btn.setEnabled(False)
+
+        # Default active camera is the microscope (primary)
+        self._active_camera = "microscope"
+        self.camera_worker = self._primary_worker  # keep alias current
 
     def _connect_camera_signals(self):
-        """Connect camera and pitch detection signals"""
-        if self.camera_worker:
-            # Frame updates - send to camera widget ONLY (not pitch pipeline until START)
-            self.camera_worker.frame_ready.connect(self.camera.update_frame)
+        """Connect the active camera worker to the display and rolling buffer."""
+        self._first_frame_logged = False
 
-            # Debug: log first frame received
-            self._first_frame_logged = False
+        if self._primary_worker:
+            self._primary_worker.frame_ready.connect(self.camera.update_frame)
+            self._primary_worker.frame_ready.connect(self.rolling_buffer.add_frame)
+            self._primary_worker.frame_ready.connect(self._on_raw_frame)
+
             def log_first_frame(frame):
                 if not self._first_frame_logged:
                     self._first_frame_logged = True
-                    self.alert_log.log(f"Camera feed active - {frame.shape[1]}x{frame.shape[0]}", "success")
-
-            self.camera_worker.frame_ready.connect(log_first_frame)
-
-            # Status updates
-            self.camera_worker.status_changed.connect(
+                    self.alert_log.log(
+                        f"Camera feed active — {frame.shape[1]}x{frame.shape[0]}", "success"
+                    )
+            self._primary_worker.frame_ready.connect(log_first_frame)
+            self._primary_worker.status_changed.connect(
                 lambda msg: self.alert_log.log(msg, "info")
             )
-            self.camera_worker.error_occurred.connect(
-                lambda err: self.alert_log.log(f"Camera error: {err}", "error")
+            self._primary_worker.error_occurred.connect(
+                lambda err: self._handle_camera_error("microscope", err)
             )
-            self.camera_worker.fps_updated.connect(self._on_fps_updated)
+            self._primary_worker.fps_updated.connect(self._on_fps_updated)
+
+        if self._secondary_worker:
+            # Secondary worker is started but its frames go nowhere yet;
+            # _on_camera_toggle connects them to the display when selected.
+            self._secondary_worker.error_occurred.connect(
+                lambda err: self._handle_camera_error("webcam", err)
+            )
 
         # Pitch detection signals - these will be connected when START is clicked
         self.pitch_pipeline.pitch_result_ready.connect(self._on_pitch_result)
@@ -1365,6 +1493,20 @@ class MainWindow(QMainWindow):
     def _on_pitch_result(self, result):
         """Handle pitch detection result"""
         try:
+            # Capture scale from pipeline; keep panel field current.
+            # If the user has already clicked Apply, only pre-fill the panel
+            # (never overwrite a manually-committed value).
+            # Auto-apply pipeline scale only until the user has committed a value.
+            # After that, the panel field belongs to the user.
+            detected_scale = getattr(result, "scale_um_per_px", 0.0)
+            if not self._calibration_manually_applied:
+                if detected_scale > 0 and detected_scale != self._calibrated_scale_um_per_px:
+                    self._calibrated_scale_um_per_px = detected_scale
+                    self._manual_overlay_panel.set_scale(detected_scale)
+                    from app_state import Mode
+                    if self.app_state.mode == Mode.MANUAL:
+                        self._recompute_pitch_overlay()
+
             # Update UI metrics
             self.pitch_actual.setText(f"{result.mean_pitch_um:.2f} μm")
 
@@ -1388,6 +1530,14 @@ class MainWindow(QMainWindow):
                 f"Pitch: {result.mean_pitch_um:.1f}μm ({result.num_wraps} wraps), Confidence: {result.confidence}",
                 confidence_colors.get(result.confidence, "info")
             )
+
+            # Auto-capture on degraded confidence
+            if result.confidence in ("LOW", "FAILED"):
+                self._auto_capture(
+                    alert_type=f"low_confidence_{result.confidence.lower()}",
+                    confidence=result.confidence,
+                    pitch_um=result.mean_pitch_um,
+                )
         except Exception as e:
             self.alert_log.log(f"Error processing pitch result: {e}", "error")
             print(f"ERROR in _on_pitch_result: {e}")
@@ -1413,6 +1563,7 @@ class MainWindow(QMainWindow):
             "Adjust alignment/focus and set speeds manually.",
             "warning"
         )
+        self._auto_capture(alert_type="manual_mode_trigger", confidence=confidence)
 
     def _on_manual_mode_acknowledged(self):
         """User acknowledged manual mode banner."""
@@ -1558,19 +1709,26 @@ class MainWindow(QMainWindow):
     def _update_metrics(self):
         if not self._is_running:
             return
-            
-        # Feed motor: 1 RPM, fluctuates 1-3
+
+        from app_state import Mode
+        if self.app_state.mode == Mode.MANUAL:
+            # In manual mode we have no real feedback yet (mock transport).
+            # Show the setpoint as both target and actual so error reads 0%.
+            self.feed_motor.update_metrics(self.app_state.feed_speed_mms)
+            self.wrapper_motor.update_metrics(self.app_state.wrap_speed_rpm)
+            return
+
+        # AUTO demo simulation (no real motor feedback yet)
         feed = 1.0 + random.gauss(0.5, 0.3)
         feed = max(0.5, min(3.0, feed))
         self.feed_motor.update_metrics(feed)
-        
-        # Wrapper: 1000 RPM, oscillates 850-1000
+
         t = datetime.now().timestamp()
         osc = math.sin(t * 0.5) * 50 + math.sin(t * 1.3) * 25
         wrapper = 925 + osc + random.gauss(0, 10)
         wrapper = max(850, min(1000, wrapper))
         self.wrapper_motor.update_metrics(wrapper)
-        
+
         if abs(feed - 1.0) > 1.0:
             self.alert_log.log(f"Feed motor deviation: {feed:.1f} RPM", "warning")
             
@@ -1586,11 +1744,120 @@ class MainWindow(QMainWindow):
         # Graph is now updated by pitch detection results
         # This is just for distance tracking
 
+    # ------------------------------------------------------------------
+    # Camera toggle
+    # ------------------------------------------------------------------
+
+    def _on_raw_frame(self, frame: np.ndarray) -> None:
+        """Keep a reference to the latest frame for auto-capture."""
+        self._current_raw_frame = frame
+
+    def _on_camera_toggle(self):
+        """Switch the displayed feed between microscope and external webcam."""
+        if self._active_camera == "microscope":
+            if self._secondary_worker is None:
+                self.alert_log.log("No secondary camera available", "warning")
+                return
+            # Disconnect primary from display/buffer; connect secondary
+            self._primary_worker.frame_ready.disconnect(self.camera.update_frame)
+            self._primary_worker.frame_ready.disconnect(self.rolling_buffer.add_frame)
+            self._primary_worker.frame_ready.disconnect(self._on_raw_frame)
+            self._secondary_worker.frame_ready.connect(self.camera.update_frame)
+            self._secondary_worker.frame_ready.connect(self.rolling_buffer.add_frame)
+            self._secondary_worker.frame_ready.connect(self._on_raw_frame)
+            self._active_camera = "webcam"
+            self.camera_worker = self._secondary_worker
+            self._cam_toggle_btn.setText("Switch to Microscope")
+            self.alert_log.log("Camera feed → webcam", "info")
+            self._cam_warning_label.hide()
+        else:
+            if self._primary_worker is None:
+                self.alert_log.log("No microscope camera available", "warning")
+                return
+            self._secondary_worker.frame_ready.disconnect(self.camera.update_frame)
+            self._secondary_worker.frame_ready.disconnect(self.rolling_buffer.add_frame)
+            self._secondary_worker.frame_ready.disconnect(self._on_raw_frame)
+            self._primary_worker.frame_ready.connect(self.camera.update_frame)
+            self._primary_worker.frame_ready.connect(self.rolling_buffer.add_frame)
+            self._primary_worker.frame_ready.connect(self._on_raw_frame)
+            self._active_camera = "microscope"
+            self.camera_worker = self._primary_worker
+            self._cam_toggle_btn.setText("Switch to Webcam")
+            self.alert_log.log("Camera feed → microscope", "info")
+            self._cam_warning_label.hide()
+
+    def _handle_camera_error(self, role: str, err: str):
+        """Handle a camera error from the given role ('microscope' or 'webcam')."""
+        self.alert_log.log(f"Camera error ({role}): {err}", "error")
+        if role == self._active_camera:
+            self._cam_warning_label.setText(f"Camera error: {role}")
+            self._cam_warning_label.show()
+
+    # ------------------------------------------------------------------
+    # Rolling-buffer recording
+    # ------------------------------------------------------------------
+
+    def _on_save_recording(self):
+        """Save the rolling 5-minute buffer to a timestamped MP4 file."""
+        if self.rolling_buffer.frame_count == 0:
+            self.alert_log.log("No frames in buffer yet — nothing to save", "warning")
+            return
+
+        path = self.storage.timestamped_path(
+            self.storage.recordings_dir, "recording", "mp4"
+        )
+        dur = self.rolling_buffer.duration_seconds
+        self.alert_log.log(
+            f"Saving recording ({dur:.0f}s, {self.rolling_buffer.frame_count} frames)...",
+            "info",
+        )
+
+        ok = self.rolling_buffer.save(path)
+        if ok:
+            self.alert_log.log(f"Recording saved: {path.name}", "success")
+        else:
+            self.alert_log.log("Recording save failed (cv2 or no frames)", "error")
+
+    # ------------------------------------------------------------------
+    # Auto-capture screenshots on significant events
+    # ------------------------------------------------------------------
+
+    def _auto_capture(
+        self,
+        alert_type: str,
+        confidence: Optional[str] = None,
+        pitch_um: Optional[float] = None,
+    ) -> None:
+        """Save a screenshot and linked alert log entry for a significant event.
+
+        Called internally when errors, warnings, low-confidence results, or
+        manual-mode triggers occur.
+        """
+        frame = self._current_raw_frame
+        if frame is None:
+            return
+
+        prefix = f"auto_{alert_type.lower().replace(' ', '_')}"
+        screenshot_path = self.storage.save_screenshot(frame, prefix=prefix)
+
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "alert_type": alert_type,
+            "confidence": confidence,
+            "pitch_um": pitch_um,
+            "active_camera": self._active_camera,
+            "screenshot": str(screenshot_path) if screenshot_path else None,
+        }
+        self.storage.save_alert_entry(entry)
+
     def closeEvent(self, event):
-        """Clean up camera worker and transport on window close."""
-        if self.camera_worker:
-            self.camera_worker.stop()
+        """Clean up camera workers, transport, and storage on window close."""
+        if self._primary_worker:
+            self._primary_worker.stop()
+        if self._secondary_worker:
+            self._secondary_worker.stop()
         self.pitch_pipeline.stop()
+        self.storage.shutdown()
         try:
             self.transport.close()
         except Exception:

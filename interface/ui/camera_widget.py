@@ -11,10 +11,13 @@ from PyQt6.QtGui import (
     QPainter, QImage, QPixmap, QColor, QPen, QBrush,
     QLinearGradient, QRadialGradient, QFont, QKeyEvent
 )
+import math
 import numpy as np
 from typing import Optional
 import random
 import cv2
+
+from .overlay_geometry import pitch_overlay_lines
 
 
 class EnhancedCameraView(QFrame):
@@ -51,8 +54,10 @@ class EnhancedCameraView(QFrame):
         self.roi_width = 400
         self.roi_height = 250
 
-        # Wrap lines (horizontal reference lines)
-        self.wrap_lines = [0.2, 0.35, 0.5, 0.65, 0.8]
+        # Pitch overlay (manual mode reference lines)
+        self._pitch_overlay_enabled: bool = False
+        self._pitch_spacing_px: float = 0.0
+        self._pitch_tilt_from_vertical_deg: float = 0.0
 
         # Overlay message (temporary toast shown over camera feed)
         self._overlay_text: Optional[str] = None
@@ -70,6 +75,30 @@ class EnhancedCameraView(QFrame):
         self._demo_timer.start(50)
 
         self._setup_style()
+
+    # ------------------------------------------------------------------
+    # Pitch overlay (manual mode)
+    # ------------------------------------------------------------------
+
+    def set_pitch_overlay(self, spacing_px: float, tilt_from_vertical_deg: float) -> None:
+        """Draw pitch reference lines for manual mode.
+
+        spacing_px             — target pitch in pixels (target_pitch_um / scale_um_per_px).
+        tilt_from_vertical_deg — helix advance angle from config.calculate_wrap_angle_deg().
+                                 Lines are nearly vertical; this is the slight tilt from
+                                 vertical caused by the helix winding on a horizontal spool.
+        """
+        self._pitch_spacing_px = max(1.0, spacing_px)
+        self._pitch_tilt_from_vertical_deg = tilt_from_vertical_deg
+        self._pitch_overlay_enabled = True
+        self.update()
+
+    def clear_pitch_overlay(self) -> None:
+        """Remove pitch reference lines (called when leaving manual mode)."""
+        self._pitch_overlay_enabled = False
+        self.update()
+
+    # ------------------------------------------------------------------
 
     def _setup_style(self):
         """Apply widget styling"""
@@ -273,14 +302,18 @@ class EnhancedCameraView(QFrame):
         """
         cx, cy = rect.width() // 2, rect.height() // 2
 
-        # Wrap lines (horizontal reference lines)
-        pen = QPen(QColor("#1a2a3a"))
-        pen.setWidth(1)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        for ratio in self.wrap_lines:
-            y = int(rect.height() * ratio)
-            painter.drawLine(0, y, rect.width(), y)
+        # Pitch overlay — lines perpendicular to thread axis, spaced by target pitch
+        if self._pitch_overlay_enabled and self._pitch_spacing_px > 0:
+            pen = QPen(QColor(0, 212, 170, 160))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            for x1, y1, x2, y2 in pitch_overlay_lines(
+                self._pitch_spacing_px,
+                self._pitch_tilt_from_vertical_deg,
+                int(rect.width()),
+                int(rect.height()),
+            ):
+                painter.drawLine(x1, y1, x2, y2)
 
         # ROI box
         roi_x = cx - self.roi_width // 2
