@@ -192,15 +192,22 @@ class SPIMotorTransport(SPITransport):
       - SPI mode (0/1/2/3) and bit order
       - max_speed_hz
       - Response framing: does Arduino set a GPIO to indicate data ready,
-        or does the RPi poll? read() currently returns nothing as a
-        placeholder until that detail lands.
+        or does the RPi poll? read() currently polls by clocking zeroes.
     """
 
-    def __init__(self, bus: int = 0, device: int = 0, max_speed_hz: int = 500_000):
+    def __init__(
+        self,
+        bus: int = 0,
+        device: int = 0,
+        max_speed_hz: int = 500_000,
+        read_length: int = 3,
+    ):
         self.bus = bus
         self.device = device
         self.max_speed_hz = max_speed_hz
+        self.read_length = read_length
         self._spi = None
+        self._inbox: List[bytes] = []
 
     def open(self) -> None:
         import spidev  # lazy
@@ -216,10 +223,21 @@ class SPIMotorTransport(SPITransport):
     def send(self, data: bytes) -> None:
         if self._spi is None:
             raise RuntimeError("SPI transport not open")
-        self._spi.xfer2(list(data))
+        response = bytes(self._spi.xfer2(list(data)))
+        if parse_arduino_response(response) is not None:
+            self._inbox.append(response)
 
     def read(self) -> List[bytes]:
-        return []  # see TODO above
+        if self._spi is None:
+            return []
+
+        response = bytes(self._spi.xfer2([0] * self.read_length))
+        if parse_arduino_response(response) is not None:
+            self._inbox.append(response)
+
+        out = self._inbox
+        self._inbox = []
+        return out
 
 
 # ----- motor controller ------------------------------------------------------

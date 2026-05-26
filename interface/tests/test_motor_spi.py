@@ -1,5 +1,8 @@
 """Unit tests for the motor SPI protocol — packet encoding/decoding + MotorController."""
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from comms.motor_spi import (
@@ -7,7 +10,7 @@ from comms.motor_spi import (
     build_start, build_stop, build_set_speed, build_test_movement,
     parse_arduino_response,
     CurrentSpeed, ErrorResponse, SequenceStatus,
-    MockSPITransport, MotorController,
+    MockSPITransport, MotorController, SPIMotorTransport,
 )
 
 
@@ -178,6 +181,64 @@ class TestMockSPITransportAndController:
         t.inject_response(bytes([ResponsePrefix.SEQUENCE_STATUS, 0x03]))
         mc.poll()
         assert statuses == [0x03]
+
+
+class TestSPIMotorTransport:
+    def test_send_clocks_packet_and_queues_parseable_response(self, monkeypatch):
+        spi_instances = []
+
+        class FakeSpiDev:
+            def __init__(self):
+                self.transfers = []
+                self.max_speed_hz = None
+                spi_instances.append(self)
+
+            def open(self, bus, device):
+                self.bus = bus
+                self.device = device
+
+            def close(self):
+                self.closed = True
+
+            def xfer2(self, data):
+                self.transfers.append(data)
+                return [ResponsePrefix.CURRENT_SPEED, 0x34, 0x12]
+
+        monkeypatch.setitem(sys.modules, "spidev", SimpleNamespace(SpiDev=FakeSpiDev))
+
+        transport = SPIMotorTransport(bus=1, device=2, max_speed_hz=123_000)
+        transport.open()
+        transport.send(bytes([CommandPrefix.SET_SPEED, 0x34, 0x12]))
+
+        assert spi_instances[0].bus == 1
+        assert spi_instances[0].device == 2
+        assert spi_instances[0].max_speed_hz == 123_000
+        assert spi_instances[0].transfers == [[CommandPrefix.SET_SPEED, 0x34, 0x12]]
+        assert transport.read() == [
+            bytes([ResponsePrefix.CURRENT_SPEED, 0x34, 0x12]),
+            bytes([ResponsePrefix.CURRENT_SPEED, 0x34, 0x12]),
+        ]
+
+    def test_read_polls_with_zeroes(self, monkeypatch):
+        class FakeSpiDev:
+            def open(self, bus, device):
+                pass
+
+            def close(self):
+                pass
+
+            def xfer2(self, data):
+                self.last_transfer = data
+                return [ResponsePrefix.CURRENT_SPEED, 0x10, 0x00]
+
+        fake = FakeSpiDev()
+        monkeypatch.setitem(sys.modules, "spidev", SimpleNamespace(SpiDev=lambda: fake))
+
+        transport = SPIMotorTransport(read_length=3)
+        transport.open()
+
+        assert transport.read() == [bytes([ResponsePrefix.CURRENT_SPEED, 0x10, 0x00])]
+        assert fake.last_transfer == [0, 0, 0]
 
 
 # qapp fixture is provided by pytest-qt via conftest.py.
