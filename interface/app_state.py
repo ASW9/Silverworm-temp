@@ -13,11 +13,19 @@ Receives events from two places:
 
 PUI precedence rule
 -------------------
-Both PUI handlers and GUI setters write to the same internal state
-through the same setters. A later PUI event simply overwrites whatever
-the GUI last set — that IS the precedence. There is no "is the GUI
-allowed to write" gate; the GUI is fine to write, it just gets clobbered
-the moment the operator touches the panel.
+PUI is the source of truth for `mode`. We track the last-known state of
+the physical auto/manual switch in `_pui_in_manual` (set by AS0/AS1).
+
+  - PUI mode-switch events always win: AS0/AS1 immediately change the mode.
+  - GUI → MANUAL is always allowed (covers low-confidence auto-trigger
+    and operator overrides "into" manual).
+  - GUI → AUTO is REJECTED while `_pui_in_manual` is True. The operator
+    must flip the physical switch to AUTO first. A `mode_change_blocked`
+    signal carries the reason so the UI can warn the user.
+
+Speeds and machine_on follow simple "last write wins" — only mode has
+a hard PUI lock, because manual mode gates access to the dial-driven
+speed inputs.
 
 Routing to motors
 -----------------
@@ -82,6 +90,8 @@ class AppState(QObject):
     machine_power_changed = pyqtSignal(bool)
     wrap_speed_changed = pyqtSignal(float)       # rpm
     feed_speed_changed = pyqtSignal(float)       # mm/s
+    motor_error = pyqtSignal(str)                # SPI / hardware error message
+    mode_change_blocked = pyqtSignal(str)        # human-readable rejection reason
 
     def __init__(
         self,
@@ -99,6 +109,11 @@ class AppState(QObject):
         self._machine_on: bool = False
         self._wrap_speed_rpm: float = 0.0
         self._feed_speed_mms: float = 0.0
+        # Last-known position of the PUI auto/manual switch. While True,
+        # GUI requests to leave manual mode are rejected. Edge-triggered
+        # from AS0/AS1; if the PUI boots in MANUAL but never sends AS0,
+        # this stays False (a hardware-sync limitation, not solvable here).
+        self._pui_in_manual: bool = False
 
     # ----- read-only accessors ------------------------------------------
 
@@ -144,7 +159,9 @@ class AppState(QObject):
             self._set_feed_speed(self._feed_speed_mms + delta)
 
     def apply_mode_switch(self, switch: ModeSwitch) -> None:
-        self._set_mode(Mode.MANUAL if switch.mode == PUIMode.MANUAL else Mode.AUTO)
+        new_mode = Mode.MANUAL if switch.mode == PUIMode.MANUAL else Mode.AUTO
+        self._pui_in_manual = (new_mode == Mode.MANUAL)
+        self._set_mode(new_mode)
 
     def apply_power_toggle(self) -> None:
         self._set_machine_on(not self._machine_on)
@@ -152,6 +169,14 @@ class AppState(QObject):
     # ----- GUI mutators (same setters — PUI just wins by overwriting) ---
 
     def gui_set_mode(self, mode: Mode) -> None:
+        # PUI lock: while the physical switch is in MANUAL, the GUI cannot
+        # leave manual mode. GUI → MANUAL is always allowed (covers low-
+        # confidence auto-trigger).
+        if mode == Mode.AUTO and self._pui_in_manual:
+            self.mode_change_blocked.emit(
+                "PUI is in MANUAL — flip the panel switch to leave manual mode"
+            )
+            return
         self._set_mode(mode)
 
     def gui_set_wrap_speed(self, rpm: float) -> None:
@@ -171,6 +196,13 @@ class AppState(QObject):
         self._mode = mode
         self.mode_changed.emit(mode)
 
+    def _motor_call(self, fn, *args) -> None:
+        """Call a motor method, catch hardware errors and emit motor_error."""
+        try:
+            fn(*args)
+        except Exception as e:
+            self.motor_error.emit(str(e))
+
     def _set_wrap_speed(self, rpm: float) -> None:
         rpm = max(WRAP_SPEED_MIN_RPM, min(WRAP_SPEED_MAX_RPM, rpm))
         if self._wrap_speed_rpm == rpm:
@@ -178,7 +210,7 @@ class AppState(QObject):
         self._wrap_speed_rpm = rpm
         self.wrap_speed_changed.emit(rpm)
         if self._machine_on and self._wrap_motor is not None:
-            self._wrap_motor.set_speed(rpm_to_units(rpm))
+            self._motor_call(self._wrap_motor.set_speed, rpm_to_units(rpm))
 
     def _set_feed_speed(self, mms: float) -> None:
         mms = max(FEED_SPEED_MIN_MMS, min(FEED_SPEED_MAX_MMS, mms))
@@ -187,7 +219,7 @@ class AppState(QObject):
         self._feed_speed_mms = mms
         self.feed_speed_changed.emit(mms)
         if self._machine_on and self._feed_motor is not None:
-            self._feed_motor.set_speed(mms_to_units(mms))
+            self._motor_call(self._feed_motor.set_speed, mms_to_units(mms))
 
     def _set_machine_on(self, on: bool) -> None:
         if self._machine_on == on:
@@ -196,14 +228,14 @@ class AppState(QObject):
         self.machine_power_changed.emit(on)
         if on:
             if self._wrap_motor is not None:
-                self._wrap_motor.start(rpm_to_units(self._wrap_speed_rpm))
+                self._motor_call(self._wrap_motor.start, rpm_to_units(self._wrap_speed_rpm))
             if self._feed_motor is not None:
-                self._feed_motor.start(mms_to_units(self._feed_speed_mms))
+                self._motor_call(self._feed_motor.start, mms_to_units(self._feed_speed_mms))
         else:
             if self._wrap_motor is not None:
-                self._wrap_motor.stop(StopType.RAMP_DOWN)
+                self._motor_call(self._wrap_motor.stop, StopType.RAMP_DOWN)
             if self._feed_motor is not None:
-                self._feed_motor.stop(StopType.RAMP_DOWN)
+                self._motor_call(self._feed_motor.stop, StopType.RAMP_DOWN)
 
     # ----- detent → increment lookup ------------------------------------
 

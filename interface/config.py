@@ -48,6 +48,8 @@ class AppConfig:
     manual_mode_gui_enabled: bool = False
     remember_settings: bool = True
     scale_um_per_px: float = 0.0  # µm per pixel; 0 = not yet calibrated
+    # "mock" = software-only (dev/macOS), "rpi5" = RPi 5 test rig, "cm5" = CM5 production
+    hw_platform: str = "mock"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -72,6 +74,7 @@ class AppConfig:
             manual_mode_gui_enabled=bool(data.get("manual_mode_gui_enabled", False)),
             remember_settings=bool(data.get("remember_settings", True)),
             scale_um_per_px=float(data.get("scale_um_per_px", 0.0)),
+            hw_platform=str(data.get("hw_platform", "mock")),
         )
 
 

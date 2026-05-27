@@ -147,6 +147,63 @@ class TestModePrecedence:
         assert state.mode == Mode.MANUAL
 
 
+class TestPUIManualLock:
+    """While PUI is in MANUAL, GUI cannot leave manual mode."""
+
+    def test_gui_auto_blocked_when_pui_in_manual(self, state_with_motors):
+        state, _, _ = state_with_motors
+        state.apply_mode_switch(ModeSwitch(PUIMode.MANUAL))
+        assert state.mode == Mode.MANUAL
+
+        state.gui_set_mode(Mode.AUTO)
+        # Lock holds — state must remain MANUAL.
+        assert state.mode == Mode.MANUAL
+
+    def test_blocked_change_emits_signal_with_reason(self, qapp, state_with_motors):
+        state, _, _ = state_with_motors
+        state.apply_mode_switch(ModeSwitch(PUIMode.MANUAL))
+
+        captured: list[str] = []
+        state.mode_change_blocked.connect(captured.append)
+        state.gui_set_mode(Mode.AUTO)
+
+        assert len(captured) == 1
+        assert "MANUAL" in captured[0].upper()
+
+    def test_pui_releases_lock_then_gui_auto_works(self, state_with_motors):
+        state, _, _ = state_with_motors
+        state.apply_mode_switch(ModeSwitch(PUIMode.MANUAL))
+        state.gui_set_mode(Mode.AUTO)  # blocked
+        assert state.mode == Mode.MANUAL
+
+        state.apply_mode_switch(ModeSwitch(PUIMode.AUTO))  # PUI releases
+        assert state.mode == Mode.AUTO
+
+        state.gui_set_mode(Mode.AUTO)  # now allowed (already auto)
+        assert state.mode == Mode.AUTO
+
+        # And GUI can flip-flop freely.
+        state.gui_set_mode(Mode.MANUAL)
+        assert state.mode == Mode.MANUAL
+        state.gui_set_mode(Mode.AUTO)
+        assert state.mode == Mode.AUTO
+
+    def test_gui_manual_allowed_when_pui_in_manual(self, state_with_motors):
+        """Auto-trigger fires gui_set_mode(MANUAL) — must succeed regardless of lock."""
+        state, _, _ = state_with_motors
+        state.apply_mode_switch(ModeSwitch(PUIMode.MANUAL))
+
+        state.gui_set_mode(Mode.MANUAL)  # no conflict
+        assert state.mode == Mode.MANUAL
+
+    def test_gui_auto_allowed_when_pui_never_set(self, state_with_motors):
+        """Initial state — no PUI events seen — GUI can do anything."""
+        state, _, _ = state_with_motors
+        state.gui_set_mode(Mode.MANUAL)
+        state.gui_set_mode(Mode.AUTO)
+        assert state.mode == Mode.AUTO
+
+
 # ============================================================================
 # Test 5: TP toggles machine_on and triggers start/stop on the motors
 # ============================================================================
