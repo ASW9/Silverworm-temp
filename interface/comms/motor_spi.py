@@ -35,16 +35,16 @@ from PyQt6.QtCore import QObject, pyqtSignal
 # ----- enums -----------------------------------------------------------------
 
 class CommandPrefix(IntEnum):
-    START = 1
-    STOP = 2
-    SET_SPEED = 3
-    TEST_MOVEMENT = 4
+    START = 0x31          # Arduino switch uses case '1' (ASCII)
+    STOP = 0x32           # case '2'
+    SET_SPEED = 0x33      # case '3'
+    TEST_MOVEMENT = 0x34  # case '4'
 
 
 class ResponsePrefix(IntEnum):
-    CURRENT_SPEED = 1
-    ERROR = 2
-    SEQUENCE_STATUS = 3
+    CURRENT_SPEED = 0x31   # Arduino setReply('1', ...)
+    ERROR = 0x32           # setReply('2', ...)
+    SEQUENCE_STATUS = 0x33 # setReply('3', ...)
 
 
 class StopType(IntEnum):
@@ -218,7 +218,7 @@ class SPIMotorTransport(SPITransport):
     def open(self) -> None:
         import spidev  # lazy
         self._spi = spidev.SpiDev()
-        self._spi.open(self.bus, self.device)
+        self._spi.open(self.bus, self. device)
         self._spi.max_speed_hz = self.max_speed_hz
         self._spi.mode = self.mode
 

@@ -20,7 +20,7 @@ except ImportError:
 
 class I2CTestListener:
     I2C_BUS = 1  # RPi I2C bus (use 0 on older Pi)
-    ESP32_ADDR = 0x08  # ESP32 controller I2C address (adjust if needed)
+    ESP32_ADDR = 0x55  # ESP32 controller I2C address (adjust if needed)
 
     def __init__(self):
         self.bus = None
@@ -44,14 +44,19 @@ class I2CTestListener:
         try:
             # Read up to 16 bytes from ESP32
             data = self.bus.read_i2c_block_data(self.ESP32_ADDR, 0, 16)
+            raw_hex = ' '.join(f'{b:02x}' for b in data)
+            # Print raw bytes so we can see what's actually arriving
+            print(f"    [raw] {raw_hex}", end='\r')
             # Filter out null bytes and parse
             msg_bytes = bytes(b for b in data if b != 0)
             if msg_bytes and msg_bytes != self.last_read:
                 self.last_read = msg_bytes
-                return msg_bytes.decode('ascii').strip()
-        except Exception:
-            # No data available or read timeout - this is normal
-            pass
+                return msg_bytes.decode('ascii', errors='replace').strip()
+        except OSError as e:
+            print(f"\n✗ I2C read error: {e}")
+            print("  → ESP32 not found at this address, or I2C wiring issue")
+        except Exception as e:
+            print(f"\n✗ Unexpected error: {e}")
         return None
 
     def handle_message(self, msg):
@@ -126,3 +131,6 @@ class I2CTestListener:
 if __name__ == "__main__":
     listener = I2CTestListener()
     listener.run()
+
+
+
