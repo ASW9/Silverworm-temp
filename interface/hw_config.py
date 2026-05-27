@@ -58,16 +58,21 @@ class PlatformConfig:
 #
 # I2C1: standard pins, always available, no overlay needed.
 # SPI0: standard pins, enabled via raspi-config → Interfacing Options → SPI.
-#   Two chip-selects (CE0, CE1) → two Arduinos on the same SPI bus.
+#   Wrap motor (Arduino) on SPI0 with chip-select CE0.
+# SPI1: secondary bus, requires dtoverlay=spi1-1cs in /boot/firmware/config.txt.
+#   Feed motor (Arduino) on SPI1 with chip-select CE0.
 #
 # Physical wiring reference:
 #   I2C SDA  GPIO2   pin 3
 #   I2C SCL  GPIO3   pin 5
-#   SPI MOSI GPIO10  pin 19
-#   SPI MISO GPIO9   pin 21
-#   SPI SCLK GPIO11  pin 23
-#   SPI CE0  GPIO8   pin 24  ← wrap motor Arduino
-#   SPI CE1  GPIO7   pin 26  ← feed motor Arduino
+#   SPI0 MOSI GPIO10  pin 19 ← wrap motor
+#   SPI0 MISO GPIO9   pin 21
+#   SPI0 SCLK GPIO11  pin 23
+#   SPI0 CE0  GPIO8   pin 24
+#   SPI1 MOSI GPIO20  pin 38 ← feed motor
+#   SPI1 MISO GPIO19  pin 35
+#   SPI1 SCLK GPIO21  pin 40
+#   SPI1 CE0  GPIO18  pin 12
 
 RPI5 = PlatformConfig(
     name="rpi5",
@@ -84,11 +89,11 @@ RPI5 = PlatformConfig(
         cs_gpio=8,           # pin 24 CE0
     ),
     feed_spi=SPIConfig(
-        bus=0, device=1,
-        mosi_gpio=10,        # pin 19  (shared bus)
-        miso_gpio=9,         # pin 21
-        sclk_gpio=11,        # pin 23
-        cs_gpio=7,           # pin 26 CE1
+        bus=1, device=0,
+        mosi_gpio=20,        # pin 38
+        miso_gpio=19,        # pin 35
+        sclk_gpio=21,        # pin 40
+        cs_gpio=18,          # pin 12 CE0
     ),
 )
 

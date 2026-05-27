@@ -8,12 +8,10 @@ Python opens Linux device files (/dev/i2c-N, /dev/spidev-B.D).
 The actual GPIO→peripheral mux is set by the OS — see hw_config.py for
 the physical pin table and bring-up notes.
 
-Optional SPI1 bus (if two SPI buses are needed in future):
-  SPI1 MOSI  GPIO20  pin 38
-  SPI1 MISO  GPIO19  pin 35
-  SPI1 SCLK  GPIO21  pin 40
-  SPI1 CE0   GPIO18  pin 12
-  (requires dtoverlay=spi1-1cs in /boot/firmware/config.txt)
+RPi5 uses SPI0 (wrap motor) and SPI1 (feed motor) separately:
+  SPI0: GPIO10 MOSI, GPIO9 MISO, GPIO11 SCLK, GPIO8 CE0
+  SPI1: GPIO20 MOSI, GPIO19 MISO, GPIO21 SCLK, GPIO18 CE0
+       (requires dtoverlay=spi1-1cs in /boot/firmware/config.txt)
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ def build_transports(config: AppConfig) -> Transports:
     Construct PUI + motor SPI transports for the configured hw_platform.
 
     "mock"       — in-memory mocks, no hardware needed (dev/macOS).
-    "rpi5"       — real I2C1 (GPIO2/3) + SPI0 CE0/CE1 (see hw_config.py).
+    "rpi5"       — real I2C1 (GPIO2/3) + SPI0 (wrap) + SPI1 (feed).
     "cm5"        — raises NotImplementedError until the CM5 is configured.
 
     Real transports lazy-import smbus2/spidev so this call is safe on
