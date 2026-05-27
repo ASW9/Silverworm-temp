@@ -188,11 +188,15 @@ class SPIMotorTransport(SPITransport):
     Real SPI transport via spidev. Lazy-imported so non-Linux dev
     machines can still load this module.
 
-    TODO confirm with Arduino firmware author:
-      - SPI mode (0/1/2/3) and bit order
-      - max_speed_hz
-      - Response framing: does Arduino set a GPIO to indicate data ready,
-        or does the RPi poll? read() currently polls by clocking zeroes.
+    Arduino firmware (Main.ino) defaults SPCR to SPI Mode 0 (CPOL=0,
+    CPHA=0). We set mode explicitly to match rather than relying on the
+    spidev default.
+
+    Response framing: the Arduino pushes a reply into SPDR during the
+    same ISR that receives a command. The RPi reads the reply by clocking
+    three zero bytes immediately after sending. No data-ready GPIO is
+    used; the assumption is that the reply is always ready for the next
+    transaction after a command is sent.
     """
 
     def __init__(
@@ -200,11 +204,13 @@ class SPIMotorTransport(SPITransport):
         bus: int = 0,
         device: int = 0,
         max_speed_hz: int = 500_000,
+        mode: int = 0,
         read_length: int = 3,
     ):
         self.bus = bus
         self.device = device
         self.max_speed_hz = max_speed_hz
+        self.mode = mode
         self.read_length = read_length
         self._spi = None
         self._inbox: List[bytes] = []
@@ -214,6 +220,7 @@ class SPIMotorTransport(SPITransport):
         self._spi = spidev.SpiDev()
         self._spi.open(self.bus, self.device)
         self._spi.max_speed_hz = self.max_speed_hz
+        self._spi.mode = self.mode
 
     def close(self) -> None:
         if self._spi is not None:

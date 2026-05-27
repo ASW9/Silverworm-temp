@@ -1,8 +1,8 @@
 """
 Physical UI (PUI) communication layer — I2C from ESP32 to Raspberry Pi.
 
-The PUI panel is an ESP32 that talks to the Pi over I2C and sends short
-ASCII messages:
+The PUI panel is an ESP32 (slave, address 0x55) that talks to the Pi over
+I2C and sends short ASCII messages:
 
     D1±N   — dial 1 changed by N detents (N ∈ {1,2,3} = small/medium/large)
     D2±N   — dial 2 changed by N detents
@@ -10,11 +10,15 @@ ASCII messages:
     AS1    — mode switch to AUTO
     TP     — toggle machine power state
 
+The ESP32 also receives status from the Pi:
+    ON     — machine started (lights power-button LED)
+    OFF    — machine stopped (dims power-button LED)
+
 This module provides:
     - PUIMessage dataclasses (DialChange, ModeSwitch, PowerToggle)
     - parse_pui_message(text) — pure parser, no I/O
     - PUITransport ABC + MockPUITransport (tests) + I2CPUITransport (Pi)
-    - PUIListener (Qt) — polls a transport and emits typed signals
+    - PUIListener (Qt) — polls a transport, emits typed signals, proxies send_status
 """
 
 from __future__ import annotations
@@ -110,6 +114,11 @@ class PUITransport(ABC):
         """Return any ASCII messages received since the previous call.
         Non-blocking; returns an empty list if nothing is pending."""
 
+    @abstractmethod
+    def send_status(self, text: str) -> None:
+        """Send a short status string to the PUI (e.g. 'ON' or 'OFF').
+        Non-blocking; silently drops if transport is not open."""
+
 
 class MockPUITransport(PUITransport):
     """In-memory transport. Tests call inject() to enqueue messages."""
@@ -118,6 +127,7 @@ class MockPUITransport(PUITransport):
         self._queue: List[str] = []
         self._lock = threading.Lock()
         self._open = False
+        self.status_sent: List[str] = []  # records send_status calls for tests
 
     def open(self) -> None:
         self._open = True
@@ -135,23 +145,28 @@ class MockPUITransport(PUITransport):
             self._queue = []
         return out
 
+    def send_status(self, text: str) -> None:
+        with self._lock:
+            self.status_sent.append(text)
+
 
 class I2CPUITransport(PUITransport):
     """
     Real I2C transport via smbus2. Lazy-imported so dev machines without
-    smbus2 can still load this module. Read framing is line-based on
-    \\n / \\r / null bytes.
+    smbus2 can still load this module.
 
-    TODO confirm with PUI firmware author:
-      - I2C address (placeholder 0x42)
-      - Read length per poll (placeholder 32 bytes)
-      - Whether ESP32 acts as I2C slave (assumed) and how it signals new data
+    ESP32 acts as I2C slave (address 0x55). The RPi polls by doing a
+    read request; the ESP32 responds via Wire.onRequest() with a
+    null-terminated ASCII command string (e.g. "TP\0").
+
+    The RPi sends status back via a plain write (no register prefix) so
+    the ESP32's Wire.onReceive() fires with the exact string bytes.
     """
 
     def __init__(
         self,
         bus_number: int = 1,
-        address: int = 0x42,
+        address: int = 0x55,
         read_length: int = 32,
     ):
         self.bus_number = bus_number
@@ -176,12 +191,26 @@ class I2CPUITransport(PUITransport):
             chunk = self._bus.read_i2c_block_data(self.address, 0, self.read_length)
         except OSError:
             return []
-        text = bytes(b for b in chunk if 0 < b < 128).decode("ascii", errors="ignore")
+        # Keep null bytes (0x00) — they are the ESP32's message terminator.
+        # Strip only non-ASCII bytes (>127).
+        raw = bytes(b for b in chunk if b < 128)
+        text = raw.decode("ascii", errors="ignore")
         self._buffer += text
         parts = re.split(r"[\r\n\x00,;]+", self._buffer)
         # Last fragment may be incomplete; keep in buffer until next read.
         self._buffer = parts[-1]
         return [p for p in parts[:-1] if p]
+
+    def send_status(self, text: str) -> None:
+        """Write a status string to the ESP32 (plain I2C write, no register)."""
+        if self._bus is None:
+            return
+        try:
+            from smbus2 import i2c_msg  # lazy — same package as smbus2
+            msg = i2c_msg.write(self.address, list(text.encode("ascii")))
+            self._bus.i2c_rdwr(msg)
+        except OSError:
+            pass
 
 
 # ----- Qt listener -----------------------------------------------------------
@@ -198,6 +227,7 @@ class PUIListener(QObject):
     power_toggled = pyqtSignal()
     raw_message = pyqtSignal(str)        # for logging/debug panel
     parse_error = pyqtSignal(str)
+    hardware_unavailable = pyqtSignal(str)  # emitted when open() fails
 
     def __init__(
         self,
@@ -212,12 +242,24 @@ class PUIListener(QObject):
         self._timer.timeout.connect(self._poll)
 
     def start(self) -> None:
-        self._transport.open()
+        try:
+            self._transport.open()
+        except Exception as e:
+            self.hardware_unavailable.emit(str(e))
+            # Still start the poll timer — read_messages() returns [] safely
+            # when the transport is not open, so we can reconnect later.
         self._timer.start()
 
     def stop(self) -> None:
         self._timer.stop()
-        self._transport.close()
+        try:
+            self._transport.close()
+        except Exception:
+            pass
+
+    def send_status(self, text: str) -> None:
+        """Forward a status string to the ESP32 (e.g. 'ON' or 'OFF')."""
+        self._transport.send_status(text)
 
     def _poll(self) -> None:
         for raw in self._transport.read_messages():

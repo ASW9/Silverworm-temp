@@ -61,6 +61,7 @@ class StartupConfigDialog(QDialog):
         # Seed with existing config if provided so the dialog is pre-populated
         # for returning users who previously checked "Remember settings".
         self._initial = initial or AppConfig()
+        self._hw_platform: str = self._initial.hw_platform
 
         self._build_ui()
         self._wire_validation()
@@ -77,6 +78,8 @@ class StartupConfigDialog(QDialog):
             detent_config=self._initial.detent_config,
             manual_mode_gui_enabled=self._initial.manual_mode_gui_enabled,
             remember_settings=self.remember_checkbox.isChecked(),
+            hw_platform=self._hw_platform,
+            scale_um_per_px=self._initial.scale_um_per_px,
         )
 
     # ----- ui construction ----------------------------------------------
@@ -212,6 +215,40 @@ class StartupConfigDialog(QDialog):
         grid.setColumnStretch(1, 1)
         outer.addLayout(grid)
 
+        # Hardware platform selector
+        platform_card = QFrame()
+        platform_card.setStyleSheet(
+            f"background-color: {_Theme.BG_CARD};"
+            f"border: 1px solid {_Theme.BORDER};"
+            f"border-radius: 8px;"
+        )
+        platform_outer = QVBoxLayout(platform_card)
+        platform_outer.setContentsMargins(14, 10, 14, 10)
+        platform_outer.setSpacing(8)
+
+        platform_title = QLabel("Hardware Platform")
+        platform_title.setStyleSheet(f"color: {_Theme.TEXT_SECONDARY}; font-size: 11px;")
+        platform_outer.addWidget(platform_title)
+
+        platform_row = QHBoxLayout()
+        platform_row.setSpacing(8)
+        self._platform_btns: dict = {}
+        for key, label, tip in [
+            ("mock",  "Mock (Dev)",  "Software-only — no hardware required"),
+            ("rpi5",  "RPi 5",       "Raspberry Pi 5 test rig (I2C bus 1)"),
+            ("cm5",   "CM5",         "CM5 production board (I2C bus 1 — confirm overlay)"),
+        ]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setChecked(key == self._hw_platform)
+            btn.setStyleSheet(self._platform_btn_style(key == self._hw_platform))
+            btn.clicked.connect(lambda _, k=key: self._on_platform_selected(k))
+            self._platform_btns[key] = btn
+            platform_row.addWidget(btn)
+        platform_outer.addLayout(platform_row)
+        outer.addWidget(platform_card)
+
         # Wrap angle preview
         preview_card = QFrame()
         preview_card.setStyleSheet(
@@ -256,6 +293,28 @@ class StartupConfigDialog(QDialog):
         button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.ok_button)
         outer.addLayout(button_row)
+
+    @staticmethod
+    def _platform_btn_style(active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton {{ background-color: {_Theme.ACCENT_PRIMARY}; "
+                f"color: {_Theme.BG_PRIMARY}; border: none; border-radius: 6px; "
+                f"padding: 6px 14px; font-weight: 600; font-size: 12px; }}"
+            )
+        return (
+            f"QPushButton {{ background-color: {_Theme.BG_ELEVATED}; "
+            f"color: {_Theme.TEXT_SECONDARY}; border: 1px solid {_Theme.BORDER}; "
+            f"border-radius: 6px; padding: 6px 14px; font-size: 12px; }}"
+            f"QPushButton:hover {{ border-color: {_Theme.BORDER_FOCUS}; "
+            f"color: {_Theme.TEXT_PRIMARY}; }}"
+        )
+
+    def _on_platform_selected(self, key: str) -> None:
+        self._hw_platform = key
+        for k, btn in self._platform_btns.items():
+            btn.setChecked(k == key)
+            btn.setStyleSheet(self._platform_btn_style(k == key))
 
     def _wire_validation(self):
         for w in (self.pitch_input, self.thickness_input, self.diameter_input):
